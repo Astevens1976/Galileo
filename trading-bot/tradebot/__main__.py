@@ -33,7 +33,7 @@ def main(argv=None) -> int:
     ap = argparse.ArgumentParser(prog="tradebot", description="DEX meme-coin trading bot")
     ap.add_argument("--config", help="JSON file overriding defaults (see config.example.json)")
     ap.add_argument("--mode", choices=["sim", "paper", "live"])
-    ap.add_argument("--chain", help="paper/live: bsc | base | ethereum | arbitrum | solana")
+    ap.add_argument("--chain", choices=["bsc", "solana"], help="bsc (default) | solana (paper only)")
     ap.add_argument("--balance", type=float, dest="starting_balance_usdt")
     ap.add_argument("--seed", type=int)
     ap.add_argument("--port", type=int, dest="dashboard_port")

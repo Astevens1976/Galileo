@@ -24,6 +24,21 @@ def pool_impact(trade_usd: float, liquidity_usd: float) -> float:
     return trade_usd / (side + trade_usd)
 
 
+def _open_or_add(positions: dict, snap: TokenSnapshot, qty: float, usd: float, ts: float, reason: str) -> Position:
+    """New position, or a later entry part added to an existing one (averaged entry)."""
+    pos = positions.get(snap.address)
+    if pos is None:
+        pos = positions[snap.address] = Position(
+            address=snap.address, symbol=snap.symbol, qty=qty, entry_price=usd / qty,
+            cost_usd=usd, opened_at=ts, reason=reason,
+            peak_price=snap.price_usd, last_price=snap.price_usd)
+    else:
+        pos.qty += qty
+        pos.cost_usd += usd
+        pos.entry_price = (pos.cost_usd - pos.proceeds_usd) / pos.qty
+    return pos
+
+
 def _close(positions: dict, pos: Position, fill: Fill) -> None:
     del positions[pos.address]
     fill.closed = True
@@ -53,7 +68,7 @@ class PaperBroker:
         usd = min(usd, self.cash)
         fee = usd * self.cfg.fee_pct / 100 + self.cfg.network_fee_usd
         net = usd - fee
-        if net <= 0 or snap.price_usd <= 0 or snap.address in self.positions:
+        if net <= 0 or snap.price_usd <= 0:
             return None
         impact = pool_impact(net, snap.liquidity_usd)
         price = snap.price_usd * (1 + impact) * (1 + self.cfg.latency_slippage_pct / 100)
@@ -61,14 +76,11 @@ class PaperBroker:
         self.cash -= usd
         self.total_fees_usd += fee
         self.total_impact_usd += net - qty * snap.price_usd
-        self.positions[snap.address] = Position(
-            address=snap.address, symbol=snap.symbol, qty=qty, entry_price=usd / qty,
-            cost_usd=usd, opened_at=ts, reason=reason,
-            peak_price=snap.price_usd, last_price=snap.price_usd,
-        )
+        _open_or_add(self.positions, snap, qty, usd, ts, reason)
         return Fill("buy", snap.address, snap.symbol, qty, price, usd, fee, impact * 100, ts)
 
-    def sell(self, address: str, fraction: float, snap: TokenSnapshot, ts: float) -> Fill | None:
+    def sell(self, address: str, fraction: float, snap: TokenSnapshot, ts: float,
+             slippage_pct: float | None = None) -> Fill | None:
         pos = self.positions.get(address)
         if pos is None:
             return None
@@ -186,8 +198,6 @@ class LiveBroker:
         usd = min(usd, self.cfg.max_live_trade_usd,
                   self.cfg.max_live_daily_spend_usd - self.day_spent, self.cash)
         self.last_error = ""
-        if snap.address in self.positions:
-            return None
         if usd < self.cfg.min_trade_usd:
             cap_left = self.cfg.max_live_daily_spend_usd - self.day_spent
             self.last_error = ("daily live spend cap reached" if cap_left < self.cfg.min_trade_usd
@@ -213,17 +223,15 @@ class LiveBroker:
         self.day_spent += usd
         self.total_fees_usd += gas
         self.total_impact_usd += max(0.0, usd - qty * snap.price_usd)
-        self.positions[snap.address] = Position(
-            address=snap.address, symbol=snap.symbol, qty=qty, entry_price=entry,
-            cost_usd=usd + gas, opened_at=ts, reason=f"{reason} · tx {tx}",
-            peak_price=snap.price_usd, last_price=snap.price_usd)
-        self.raw[snap.address] = got
+        _open_or_add(self.positions, snap, qty, usd + gas, ts, f"{reason} · tx {tx}")
+        self.raw[snap.address] = self.raw.get(snap.address, 0) + got
         self.refresh()
         self._save()
         return Fill("buy", snap.address, snap.symbol, qty, entry, usd, gas,
                     (entry / snap.price_usd - 1) * 100 if snap.price_usd else 0.0, ts)
 
-    def sell(self, address: str, fraction: float, snap: TokenSnapshot | None, ts: float) -> Fill | None:
+    def sell(self, address: str, fraction: float, snap: TokenSnapshot | None, ts: float,
+             slippage_pct: float | None = None) -> Fill | None:
         pos = self.positions.get(address)
         if pos is None:
             return None
@@ -232,7 +240,7 @@ class LiveBroker:
         path = list(reversed(self.paths[address]))
         gas0 = self.client.gas_spent_wei
         try:
-            got, tx = self.client.swap(path, amount, self.cfg.exit_slippage_pct,
+            got, tx = self.client.swap(path, amount, slippage_pct or self.cfg.exit_slippage_pct,
                                        self.taxes.get(address, (0, 0))[1])
         except self._SwapError as e:
             pos.sell_failures += 1

@@ -50,7 +50,9 @@ class Engine:
         self.halt_reason = ""
         self.peak_equity = cfg.starting_balance_usdt
         self.day = None
-        self.day_start_equity = cfg.starting_balance_usdt
+        self.day_peak_equity = cfg.starting_balance_usdt
+        self.loss_streak = 0
+        self.coin_pnl: dict[str, float] = {}
         self.started_at = feed.now()
         self.ticks = 0
         self.headline = "starting"
@@ -115,7 +117,10 @@ class Engine:
             pos.missing_ticks = 0
             pos.last_price = s.price_usd
             pos.peak_price = max(pos.peak_price, s.price_usd)
-            reason = self.stop.check(pos, s, now)
+            dev_bal = None
+            if pos.creator_address and pos.creator_balance_at_entry:
+                dev_bal = self._wallet_balance(addr, pos.creator_address)
+            reason = self.stop.check(pos, s, now, dev_bal)
             if reason:
                 fill = self.broker.sell(addr, 1.0, s, now)
                 self._record(fill, reason, "stop") if fill else self._sell_failed(addr, now)
@@ -123,12 +128,37 @@ class Engine:
             tp = self.taker.check(pos, s)
             if tp:
                 frac, reason = tp
-                fill = self.broker.sell(addr, frac, s, now)
+                fill = self.broker.sell(addr, frac, s, now, self.cfg.take_profit_slippage_pct)
                 if fill:
                     self._record(fill, reason, "sell")
                 else:
                     pos.ladder_hits -= 1          # retry this rung next tick
                     self._sell_failed(addr, now)
+                continue
+            if pos.parts_left > 0:
+                self._next_entry_part(pos, s, now)
+
+    def _next_entry_part(self, pos, s: TokenSnapshot, now: float) -> None:
+        x = s.price_usd / pos.entry_price
+        if self.halted or not 0.95 <= x <= 1.20:          # don't average down or chase
+            pos.parts_left = 0
+            self._event(now, "info", pos.symbol, f"entry part skipped (price {x - 1:+.0%} since part 1)")
+            return
+        fill = self.broker.buy(s, min(pos.part_usd, self.broker.cash), now, "entry part")
+        if fill:
+            pos.parts_left -= 1
+            pos.initial_qty = pos.qty
+            self.sniper.touch(f"BUY part ${s.symbol} · {fill.usd:,.2f}")
+            self._record(fill, f"entry part {self.cfg.entry_parts - pos.parts_left}/{self.cfg.entry_parts}", "buy")
+        else:
+            pos.parts_left = 0
+
+    def _wallet_balance(self, token: str, wallet: str):
+        fn = getattr(self.feed, "wallet_balance", None)
+        try:
+            return fn(token, wallet) if fn else None
+        except Exception:
+            return None
 
     # --------------------------------------------------------------- entries
     def _scan(self, snaps: dict[str, TokenSnapshot], now: float) -> None:
@@ -147,7 +177,7 @@ class Engine:
         return (s.price_usd > 0 and s.liquidity_usd >= c.min_liquidity_usd
                 and 0 < s.market_cap_usd <= c.max_market_cap_usd
                 and c.min_age_min <= s.age_min <= c.max_age_min
-                and s.volume_1h_usd >= c.min_volume_1h_usd
+                and s.volume_5m_usd >= c.min_volume_5m_usd
                 and s.buys_5m + s.sells_5m >= c.min_txns_5m)
 
     def _evaluate(self, s: TokenSnapshot, now: float) -> None:
@@ -156,12 +186,17 @@ class Engine:
             self.next_eval[a] = now + 60
             return
         self.stats["checked"] += 1
-        for agent in (self.whale, self.sentiment):
-            ok, why = agent.evaluate(s)
-            if not ok:
-                self.next_eval[a] = now + self.cfg.reevaluate_after_min * 60
-                self._pipe(s, "watching", why)
-                return
+        c = self.cfg
+        if s.price_change_1h_pct >= c.max_chase_1h_pct and s.price_change_5m_pct > -c.chase_pullback_pct:
+            self.next_eval[a] = now + c.reevaluate_after_min * 60
+            self._pipe(s, "watching", f"no chase: +{s.price_change_1h_pct:.0f}% in 1h, no pullback")
+            return
+        signals = [agent.evaluate(s) for agent in (self.whale, self.sentiment)]
+        flagged = [why for ok, why in signals if ok]
+        if len(flagged) < min(c.min_signals, len(signals)):
+            self.next_eval[a] = now + c.reevaluate_after_min * 60
+            self._pipe(s, "watching", " · ".join(why for _, why in signals))
+            return
         try:
             report = self.feed.safety(a)
         except FeedError:
@@ -175,8 +210,9 @@ class Engine:
                 self._pipe(s, "blocked", why)
                 self._event(now, "blocked", s.symbol, why)
                 return
-        flow = f"buys {s.buys_5m / max(s.buys_5m + s.sells_5m, 1):.0%} of flow · vol {s.volume_5m_usd / max(s.volume_1h_usd / 12, 1):.1f}x"
-        usd, size_note = self.sizer.size(s, self.equity(), self.broker.cash)
+        flow = " · ".join(flagged)
+        total_usd, size_note = self.sizer.size(s, self.equity(), self.broker.cash, self.loss_streak)
+        usd = total_usd / c.entry_parts
         if usd < self.cfg.min_trade_usd:
             self.next_eval[a] = now + self.cfg.reevaluate_after_min * 60
             self._pipe(s, "skipped", f"size ${usd:.2f} too small")
@@ -196,9 +232,17 @@ class Engine:
             self._event(now, "error", s.symbol, f"buy not executed: {self.broker.last_error}")
         if fill:
             self.done.add(a)
+            pos = self.broker.positions[a]
+            pos.initial_qty = pos.qty
+            pos.parts_left, pos.part_usd = c.entry_parts - 1, usd
+            pos.entry_liquidity = s.liquidity_usd
+            if report.creator_address:
+                pos.creator_address = report.creator_address
+                pos.creator_balance_at_entry = self._wallet_balance(a, report.creator_address)
             self.sniper.touch(f"BUY ${s.symbol} · impact {fill.impact_pct:.2f}%")
             self._pipe(s, "bought", flow)
-            self._record(fill, f"{flow} · {size_note}", "buy")
+            parts = f" · part 1/{c.entry_parts}" if c.entry_parts > 1 else ""
+            self._record(fill, f"{flow} · {size_note}{parts}", "buy")
 
     def _kill_switch(self, now: float, snaps) -> None:
         path = self.cfg.kill_switch_file
@@ -221,16 +265,19 @@ class Engine:
         eq = self.equity()
         day = int(now // 86400)
         if day != self.day:
-            self.day, self.day_start_equity = day, eq
+            self.day, self.day_peak_equity = day, eq
             if self.halted and self.halt_reason.startswith("daily"):
                 self.halted, self.halt_reason = False, ""
-                self._event(now, "info", "", "new day: daily loss limit reset")
+                self._event(now, "info", "", "new day: daily limits reset")
+        self.day_peak_equity = max(self.day_peak_equity, eq)
         if self.halted:
             return
-        if eq <= self.cfg.starting_balance_usdt * (1 - self.cfg.max_total_drawdown_pct / 100):
-            self._halt(now, f"total drawdown limit -{self.cfg.max_total_drawdown_pct:g}% hit")
-        elif eq <= self.day_start_equity * (1 - self.cfg.max_daily_loss_pct / 100):
-            self._halt(now, f"daily loss limit -{self.cfg.max_daily_loss_pct:g}% hit")
+        c = self.cfg
+        if eq <= c.starting_balance_usdt * (1 - c.max_total_drawdown_pct / 100):
+            self._halt(now, f"total drawdown limit -{c.max_total_drawdown_pct:g}% hit")
+        elif eq <= self.day_peak_equity * (1 - c.max_drawdown_from_day_peak_pct / 100):
+            self._halt(now, f"daily drawdown -{c.max_drawdown_from_day_peak_pct:g}% from today's peak "
+                            f"(${self.day_peak_equity:,.2f} -> ${eq:,.2f})")
 
     def _halt(self, now: float, reason: str) -> None:
         self.halted, self.halt_reason = True, reason
@@ -268,9 +315,12 @@ class Engine:
             if fill.pnl_usd > 0:
                 st["wins"] += 1
                 st["gross_win"] += fill.pnl_usd
+                self.loss_streak = 0
             else:
                 st["losses"] += 1
                 st["gross_loss"] += -fill.pnl_usd
+                self.loss_streak += 1
+            self.coin_pnl[fill.symbol] = self.coin_pnl.get(fill.symbol, 0.0) + fill.pnl_usd
             if fill.multiple > st["best_x"]:
                 st["best_x"], st["best_symbol"] = fill.multiple, fill.symbol
             if st["worst_x"] is None or fill.multiple < st["worst_x"]:
@@ -345,8 +395,10 @@ class Engine:
             f"- Closed trades: {closed} (wins {st['wins']}, losses {st['losses']}"
             + (f", win rate {st['wins'] / closed:.0%})" if closed else ")"),
             f"- Avg win ${avg_w:,.2f} · avg loss ${avg_l:,.2f} · profit factor {pf:.2f}",
-            f"- Best {st['best_x']:.2f}x ${st['best_symbol']}"
-            + (f" · worst {st['worst_x']:.2f}x ${st['worst_symbol']}" if st["worst_x"] is not None else ""),
+            f"- Best trade {st['best_x']:.2f}x ${st['best_symbol']}"
+            + (f" · worst trade {st['worst_x']:.2f}x ${st['worst_symbol']}" if st["worst_x"] is not None else ""),
+            "- Top coins: " + (", ".join(f"${sym} {pnl:+,.2f}" for sym, pnl in
+                                         sorted(self.coin_pnl.items(), key=lambda kv: -kv[1])[:3]) or "none"),
             f"- Open positions: {len(self.broker.positions)}",
             f"- Launches seen {self.launches_seen} · checked {st['checked']} · blocked by audit {st['blocked']}",
             f"- Paid in fees ${self.broker.total_fees_usd:,.2f} · lost to price impact/slippage ${self.broker.total_impact_usd:,.2f}",

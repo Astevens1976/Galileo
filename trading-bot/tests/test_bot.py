@@ -1,7 +1,7 @@
 import pytest
 
 from tradebot.__main__ import main
-from tradebot.agents import LPAuditor, ProfitTaker, StopGuard
+from tradebot.agents import HolderMap, LPAuditor, ProfitTaker, RiskSizer, StopGuard
 from tradebot.broker import PaperBroker, pool_impact
 from tradebot.config import Config, load_config
 from tradebot.engine import Engine
@@ -18,11 +18,11 @@ def snap(price=1.0, liq=100_000, **kw):
 
 
 def test_round_trip_at_same_price_loses_money_to_costs():
-    cfg = Config()
+    cfg = Config(starting_balance_usdt=1000)
     b = PaperBroker(cfg)
     b.buy(snap(), 100, 0, "t")
     fill = b.sell("A", 1.0, snap(), 1)
-    assert fill.closed and fill.pnl_usd < -2      # 2x 1% fee + 2x 1% latency + impact
+    assert fill.closed and fill.pnl_usd < -2      # 2x 0.5% fee + 2x 1% latency + impact
     assert b.cash == pytest.approx(1000 + fill.pnl_usd)
     assert not b.positions
 
@@ -41,10 +41,17 @@ def test_hard_stop_trailing_and_time_stop():
     assert g.check(p, snap(price=p.entry_price * 0.95), 60) is None
     assert "hard stop" in g.check(p, snap(price=p.entry_price * 0.87), 60)
     p.peak_price = p.entry_price * 1.5
-    assert "trailing" in g.check(p, snap(price=p.peak_price * 0.77), 60)
+    assert g.check(p, snap(price=p.peak_price * 0.77), 60) is None          # -23%: inside the 25% trail
+    assert "trailing" in g.check(p, snap(price=p.peak_price * 0.74), 60)
     p.peak_price = p.entry_price
-    assert "time stop" in g.check(p, snap(price=p.entry_price), 46 * 60)
+    assert g.check(p, snap(price=p.entry_price), 24 * 60) is None
+    assert "time stop" in g.check(p, snap(price=p.entry_price), 26 * 60)
     assert "liquidity" in g.check(p, snap(price=p.entry_price, liq=500), 60)
+    p.entry_liquidity = 100_000
+    assert "LP pulled" in g.check(p, snap(price=p.entry_price, liq=45_000), 60)
+    p.creator_balance_at_entry = 1000.0
+    assert g.check(p, snap(price=p.entry_price), 60, dev_balance=900.0) is None
+    assert "dev sold" in g.check(p, snap(price=p.entry_price), 60, dev_balance=500.0)
 
 
 def test_profit_ladder_fires_each_rung_once():
@@ -52,11 +59,14 @@ def test_profit_ladder_fires_each_rung_once():
     b = PaperBroker(cfg)
     b.buy(snap(), 50, 0, "t")
     p = b.positions["A"]
+    p.initial_qty = p.qty
     t = ProfitTaker(cfg)
     assert t.check(p, snap(price=p.entry_price * 1.9)) is None
-    assert t.check(p, snap(price=p.entry_price * 2.1)) == (0.5, "TP 2x hit")
+    assert t.check(p, snap(price=p.entry_price * 2.1))[0] == pytest.approx(0.4)   # 40% of original
     assert t.check(p, snap(price=p.entry_price * 2.1)) is None
-    assert t.check(p, snap(price=p.entry_price * 5.5))[0] == 0.6
+    p.qty *= 0.6
+    assert t.check(p, snap(price=p.entry_price * 4.5))[0] == pytest.approx(0.5)   # 30% of original = half of what's left
+    assert t.check(p, snap(price=p.entry_price * 9)) is None                      # last 30% is the runner
 
 
 def test_auditor_fails_closed_and_blocks_flags():
@@ -147,7 +157,7 @@ def test_parse_dexscreener_keeps_only_executable_bsc_pools():
                 "priceUsd": "1", "liquidity": {"usd": liq}}
     pairs = [pair("pancakeswap", ["v3"], 900_000), pair("uniswap", [], 800_000),
              pair("pancakeswap", ["v2"], 50_000)]
-    s = parse_dexscreener_pairs(pairs, 0, "bsc", ["pancakeswap"])["0xT"]
+    s = parse_dexscreener_pairs(pairs, 0, "bsc", ["pancakeswap"], skip_v3=True)["0xT"]
     assert s.pair_address == "P50000" and s.quote_address == "0xQ" and s.dex_id == "pancakeswap"
 
 
@@ -173,5 +183,61 @@ def test_parse_goplus():
 def test_auditor_blocks_high_tax_and_unlocked_lp():
     a = LPAuditor(Config())
     assert "tax" in a.evaluate(snap(), SafetyReport(buy_tax_pct=2, sell_tax_pct=15))[1]
-    assert "LP locked" in a.evaluate(snap(), SafetyReport(lp_locked_pct=20))[1]
+    assert "of LP burned/locked" in a.evaluate(snap(), SafetyReport(lp_locked_pct=20))[1]
     assert a.evaluate(snap(), SafetyReport(buy_tax_pct=2, sell_tax_pct=3, lp_locked_pct=95))[0]
+
+
+def test_holder_map_rules():
+    h = HolderMap(Config())
+    assert "holders" in h.evaluate(snap(), SafetyReport(holder_count=120))[1]
+    assert "dev wallet" in h.evaluate(snap(), SafetyReport(creator_pct=8))[1]
+    assert "top 10" in h.evaluate(snap(), SafetyReport(top10_pct=40))[1]
+    assert h.evaluate(snap(), SafetyReport(holder_count=900, creator_pct=2, top10_pct=20))[0]
+
+
+def test_sizer_uses_20_to_40_pct_and_halves_after_two_losses():
+    r = RiskSizer(Config())
+    calm, wild = snap(price_change_5m_pct=0), snap(price_change_5m_pct=60)
+    assert r.size(calm, 100, 100)[0] == pytest.approx(40)
+    assert r.size(wild, 100, 100)[0] == pytest.approx(20)
+    assert r.size(calm, 100, 100, loss_streak=2)[0] == pytest.approx(20)
+    assert r.size(calm, 100, 100, loss_streak=1)[0] == pytest.approx(40)
+
+
+def test_goplus_lp_lock_duration_dev_and_holders():
+    now = 1_700_000_000
+    data = {"result": {"0xabc": {
+        "is_open_source": "1", "buy_tax": "0", "sell_tax": "0", "holder_count": "812",
+        "creator_percent": "0.031", "creator_address": "0xDEV",
+        "lp_holders": [
+            {"address": "0x1", "percent": "0.5", "is_locked": 1,
+             "locked_detail": [{"end_time": str(now + 7 * 86400)}]},          # only a week
+            {"address": "0x2", "percent": "0.3", "is_locked": 1,
+             "locked_detail": [{"end_time": "2030-01-01T00:00:00+00:00"}]}]}}}
+    r = parse_goplus(data, "0xabc", now=now, min_lock_days=30)
+    assert r.holder_count == 812 and r.creator_pct == pytest.approx(3.1) and r.creator_address == "0xDEV"
+    assert r.lp_locked_pct == pytest.approx(80) and r.lp_locked_long_pct == pytest.approx(30)
+    assert "burned/locked 30d+" in LPAuditor(Config()).evaluate(snap(), r)[1]
+
+
+def test_no_chasing_and_two_signals_required():
+    cfg = Config(min_liquidity_usd=0, min_volume_5m_usd=0, min_txns_5m=0, min_age_min=0)
+    e = Engine(cfg, SimFeed(cfg))
+    chased = snap(buys_5m=90, sells_5m=10, volume_5m_usd=50_000, volume_1h_usd=60_000,
+                  price_change_1h_pct=400, price_change_5m_pct=2)
+    e._evaluate(chased, 0)
+    assert e.pipeline[-1]["verdict"] == "watching" and "no chase" in e.pipeline[-1]["why"]
+    one_signal = snap(address="B", buys_5m=90, sells_5m=10, volume_5m_usd=5_000, volume_1h_usd=60_000)
+    e._evaluate(one_signal, 0)
+    assert e.pipeline[-1]["verdict"] == "watching" and not e.broker.positions
+
+
+def test_drawdown_from_day_peak_pauses_entries():
+    cfg = Config(seed=1)
+    e = Engine(cfg, SimFeed(cfg))
+    e.tick()
+    e.broker.cash = cfg.starting_balance_usdt * 1.5      # new high for the day
+    e.tick()
+    e.broker.cash = cfg.starting_balance_usdt * 1.0      # -33% from that high
+    e.tick()
+    assert e.halted and "today's peak" in e.halt_reason

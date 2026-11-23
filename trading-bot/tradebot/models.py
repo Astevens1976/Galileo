@@ -16,6 +16,7 @@ class TokenSnapshot:
     volume_5m_usd: float = 0.0
     volume_1h_usd: float = 0.0
     price_change_5m_pct: float = 0.0
+    price_change_1h_pct: float = 0.0
     pair_address: str = ""
     quote_address: str = ""
     dex_id: str = ""
@@ -31,6 +32,10 @@ class SafetyReport:
     lp_locked_pct: float | None = None
     buy_tax_pct: float | None = None
     sell_tax_pct: float | None = None
+    lp_locked_long_pct: float | None = None   # burned, or locked past the min lock period
+    holder_count: int | None = None
+    creator_pct: float | None = None
+    creator_address: str = ""
     dangers: list[str] = field(default_factory=list)
     warnings: list[str] = field(default_factory=list)
 
@@ -50,6 +55,12 @@ class Position:
     ladder_hits: int = 0
     missing_ticks: int = 0
     sell_failures: int = 0
+    initial_qty: float = 0.0          # size once all entry parts are in; ladder is % of this
+    parts_left: int = 0               # entry parts still to buy
+    part_usd: float = 0.0
+    entry_liquidity: float = 0.0
+    creator_address: str = ""
+    creator_balance_at_entry: float | None = None
 
 
 @dataclass

@@ -120,7 +120,8 @@ def test_buy_partial_sell_full_sell_on_chain(chain, cfg):
     held = chain.meme.functions.balanceOf(chain.bot.address).call()
     assert held > 0 and b.raw[chain.meme.address] == held
     assert chain.usdt.functions.allowance(chain.bot.address, chain.router.address).call() == 0  # exact approval
-    assert b.positions[chain.meme.address].entry_price == pytest.approx(s.price_usd, rel=0.02)
+    # entry includes the test chain's (expensive) gas, so it sits a few % above market
+    assert b.positions[chain.meme.address].entry_price == pytest.approx(s.price_usd, rel=0.06)
 
     part = b.sell(chain.meme.address, 0.5, s, time.time())
     assert part and not part.closed
@@ -220,8 +221,8 @@ class ChainFeed:
 
 
 def _engine(chain, cfg):
-    for k in ("min_liquidity_usd", "min_age_min", "min_volume_1h_usd", "min_txns_5m",
-              "min_buy_sell_ratio", "min_volume_accel"):
+    for k in ("min_liquidity_usd", "min_age_min", "min_volume_5m_usd", "min_txns_5m",
+              "min_buy_share", "min_volume_spike"):
         setattr(cfg, k, 0)
     b = LiveBroker(cfg, chain.client)
     cfg.starting_balance_usdt = b.equity({})
@@ -229,6 +230,7 @@ def _engine(chain, cfg):
 
 
 def test_engine_end_to_end_buy_take_profit_then_trailing_stop(chain, cfg):
+    cfg.entry_parts = 1
     e = _engine(chain, cfg)
     e.tick()
     assert chain.meme.address in e.broker.positions, e.state()["pipeline"]
@@ -260,3 +262,16 @@ def test_kill_switch_sells_everything_and_halts(chain, cfg):
 def test_selftest_round_trip(chain, cfg, capsys):
     assert run_selftest(cfg, "", 5.0, chain.meme.address, client=chain.client) == 0
     assert "PASS" in capsys.readouterr().out
+
+
+def test_entry_is_split_into_two_buys(chain, cfg):
+    e = _engine(chain, cfg)            # entry_parts = 2 by default
+    e.tick()
+    first = e.broker.raw[chain.meme.address]
+    assert e.broker.positions[chain.meme.address].parts_left == 1
+    e.tick()                            # price unchanged -> second part goes in
+    pos = e.broker.positions[chain.meme.address]
+    assert pos.parts_left == 0
+    assert e.broker.raw[chain.meme.address] == pytest.approx(2 * first, rel=0.01)
+    assert chain.meme.functions.balanceOf(chain.bot.address).call() == e.broker.raw[chain.meme.address]
+    assert pos.initial_qty == pytest.approx(pos.qty)

@@ -66,13 +66,13 @@ class _SimToken:
         self.address = "".join(rng.choice(_B58) for _ in range(44))
         self.symbol = rng.choice(_SYLLABLES) + rng.choice(_SYLLABLES + [""])
         self.fate = rng.choices([f for f, _ in self.FATES], [w for _, w in self.FATES])[0]
-        mcap0 = rng.uniform(20e3, 150e3)
+        mcap0 = rng.uniform(150e3, 1.5e6)
         self.supply = 1e9
         self.p0 = self.price = mcap0 / self.supply
         self.liq0 = mcap0 * rng.uniform(0.15, 0.3)
         self.liq_mult = 1.0
         self.activity = rng.uniform(0.5, 2.0)
-        self.avg_trade = rng.uniform(60, 350)
+        self.avg_trade = rng.uniform(150, 900)
         self.rugged = False
 
         u = rng.uniform
@@ -85,6 +85,9 @@ class _SimToken:
         else:  # rug: looks like a pump, then the pool gets pulled
             self.run_min, self.run_drift, self.after_drift = u(5, 40), u(0.005, 0.02), -0.01
         self.rug_at = self.run_min + u(0, 20)
+        # the dev usually sells before the pool is pulled (sometimes not at all)
+        self.dev_sell_at = (self.rug_at - u(0.5, 3) if self.fate == "rug" and rng.random() < 0.7
+                            else u(10, 240) if rng.random() < 0.3 else None)
 
         # Safety flags correlate with fate, but imperfectly - some rugs look clean.
         p_flag = {"rug": 0.65, "fade": 0.3, "pump": 0.12, "moon": 0.1}[self.fate]
@@ -94,7 +97,12 @@ class _SimToken:
             freeze_authority="freeze" in flags,
             lp_unlocked="lp" in flags,
             top10_pct=rng.uniform(30, 70) if self.fate == "rug" else rng.uniform(12, 40),
+            lp_locked_long_pct=rng.uniform(0, 40) if "lp" in flags else rng.uniform(60, 100),
+            holder_count=int(rng.uniform(80, 1500) if self.fate in ("rug", "fade") else rng.uniform(200, 4000)),
+            creator_pct=rng.uniform(1, 20) if self.fate == "rug" else rng.uniform(0, 8),
+            creator_address="dev",
         )
+        self.creator_balance = self.safety.creator_pct / 100 * self.supply
         for f, label in (("mint", "Mint authority still enabled"),
                          ("freeze", "Freeze authority still enabled"),
                          ("lp", "Large amount of LP unlocked")):
@@ -107,6 +115,8 @@ class _SimToken:
         self.vol60 = _Rolling(per60)
         self.prices = deque(maxlen=per5 + 1)
         self.prices.append(self.price)
+        self.prices_1h = deque(maxlen=per60 + 1)
+        self.prices_1h.append(self.price)
 
     def drift(self, age_min: float) -> float:
         return self.run_drift if age_min < self.run_min else self.after_drift
@@ -122,8 +132,12 @@ class _SimToken:
             pull = rng.uniform(0.01, 0.08)
             logret += math.log(pull)
             self.liq_mult *= pull
-        if rng.random() < 0.002 * (dt_s / 15):        # random whale / dev dump
+        if rng.random() < 0.002 * (dt_s / 15):        # random whale dump
             logret += math.log(rng.uniform(0.6, 0.85))
+        if self.dev_sell_at is not None and age >= self.dev_sell_at and self.creator_balance > 0:
+            self.creator_balance *= rng.uniform(0, 0.3)  # dev dumps most of the bag
+            self.dev_sell_at = None
+            logret += math.log(rng.uniform(0.65, 0.9))
         self.price *= math.exp(logret)
 
         perceived = d + rng.gauss(0, 0.04)             # flow is a noisy hint, not the truth
@@ -139,6 +153,7 @@ class _SimToken:
         self.vol5.push(vol)
         self.vol60.push(vol)
         self.prices.append(self.price)
+        self.prices_1h.append(self.price)
 
     def snapshot(self, now: float) -> TokenSnapshot:
         p_old = self.prices[0]
@@ -149,6 +164,7 @@ class _SimToken:
             buys_5m=int(self.buys5.total), sells_5m=int(self.sells5.total),
             volume_5m_usd=self.vol5.total, volume_1h_usd=self.vol60.total,
             price_change_5m_pct=(self.price / p_old - 1) * 100 if p_old else 0.0,
+            price_change_1h_pct=(self.price / self.prices_1h[0] - 1) * 100,
         )
 
 
@@ -194,6 +210,10 @@ class SimFeed:
         t = self.tokens.get(address)
         return t.safety if t else SafetyReport(available=False)
 
+    def wallet_balance(self, token: str, wallet: str) -> float | None:
+        t = self.tokens.get(token)
+        return t.creator_balance if t and wallet == "dev" else None
+
 
 # ============================================================================
 # Real market data: DexScreener + RugCheck (Solana) / GoPlus (EVM). No API keys.
@@ -228,18 +248,18 @@ def _f(v, default=0.0) -> float:
 
 
 def parse_dexscreener_pairs(pairs, now: float, chain: str = "solana",
-                            allowed_dex=()) -> dict[str, TokenSnapshot]:
+                            allowed_dex=(), skip_v3: bool = False) -> dict[str, TokenSnapshot]:
     """Best-liquidity tradable pair per base token -> TokenSnapshot.
 
-    allowed_dex limits to DEXes we can execute on (e.g. pancakeswap); V3/V4
-    pools are skipped because execution goes through a V2 router."""
+    allowed_dex limits to DEXes we can execute on (e.g. pancakeswap); skip_v3
+    drops V3/V4 pools when execution goes through a single V2 router."""
     best: dict[str, tuple[float, dict]] = {}
     for p in pairs or []:
         if p.get("chainId") != chain:
             continue
         if allowed_dex and p.get("dexId") not in allowed_dex:
             continue
-        if {"v3", "v4"} & {str(x).lower() for x in (p.get("labels") or [])}:
+        if skip_v3 and {"v3", "v4"} & {str(x).lower() for x in (p.get("labels") or [])}:
             continue
         addr = (p.get("baseToken") or {}).get("address")
         liq = _f((p.get("liquidity") or {}).get("usd"))
@@ -262,6 +282,7 @@ def parse_dexscreener_pairs(pairs, now: float, chain: str = "solana",
             volume_5m_usd=_f(vol.get("m5")),
             volume_1h_usd=_f(vol.get("h1")),
             price_change_5m_pct=_f((p.get("priceChange") or {}).get("m5")),
+            price_change_1h_pct=_f((p.get("priceChange") or {}).get("h1")),
             pair_address=p.get("pairAddress") or "",
             quote_address=(p.get("quoteToken") or {}).get("address") or "",
             dex_id=p.get("dexId") or "",
@@ -272,7 +293,22 @@ def parse_dexscreener_pairs(pairs, now: float, chain: str = "solana",
 _DEAD = {"0x0000000000000000000000000000000000000000", "0x000000000000000000000000000000000000dead"}
 
 
-def parse_goplus(data: dict, address: str) -> SafetyReport:
+def _unix(v) -> float | None:
+    if v in (None, ""):
+        return None
+    try:
+        return float(v)
+    except (TypeError, ValueError):
+        pass
+    try:
+        from datetime import datetime
+        return datetime.fromisoformat(str(v).replace("Z", "+00:00")).timestamp()
+    except ValueError:
+        return None
+
+
+def parse_goplus(data: dict, address: str, now: float | None = None,
+                 min_lock_days: float = 30) -> SafetyReport:
     """GoPlus token security (EVM chains). Unknown answers count against the token."""
     res = (data or {}).get("result") or {}
     t = res.get(address.lower()) or (next(iter(res.values())) if res else None)
@@ -312,8 +348,28 @@ def parse_goplus(data: dict, address: str) -> SafetyReport:
             setattr(rep, attr, _f(v) * 100)
     lp = t.get("lp_holders") or []
     if lp:
-        rep.lp_locked_pct = 100 * sum(_f(h.get("percent")) for h in lp
-                                      if str(h.get("is_locked")) == "1" or str(h.get("address", "")).lower() in _DEAD)
+        now = time.time() if now is None else now
+        burned = locked = long = 0.0
+        for h in lp:
+            pct = _f(h.get("percent"))
+            if str(h.get("address", "")).lower() in _DEAD:
+                burned += pct
+            elif str(h.get("is_locked")) == "1":
+                locked += pct
+                ends = [_unix(d.get("end_time")) for d in (h.get("locked_detail") or [])]
+                ends = [e for e in ends if e is not None]
+                if not ends:
+                    rep.warnings.append("LP lock duration unknown")
+                    long += pct
+                elif min(ends) >= now + min_lock_days * 86400:
+                    long += pct
+        rep.lp_locked_pct = 100 * (burned + locked)
+        rep.lp_locked_long_pct = 100 * (burned + long)
+    if t.get("holder_count") not in (None, ""):
+        rep.holder_count = int(_f(t.get("holder_count")))
+    if t.get("creator_percent") not in (None, ""):
+        rep.creator_pct = _f(t.get("creator_percent")) * 100
+    rep.creator_address = str(t.get("creator_address") or "")
     holders = [h for h in (t.get("holders") or [])
                if str(h.get("is_contract")) != "1" and str(h.get("is_locked")) != "1"
                and str(h.get("address", "")).lower() not in _DEAD]
@@ -359,9 +415,24 @@ class DexScreenerFeed:
         self.http = _Http()
         self._seen: set[str] = set()
         self._safety: dict[str, tuple[float, SafetyReport]] = {}
+        self._w3 = None
 
     def now(self) -> float:
         return time.time()
+
+    def wallet_balance(self, token: str, wallet: str) -> float | None:
+        """Token balance of any wallet (read-only RPC; used to spot the dev selling)."""
+        if self.chain == "solana" or not wallet or not self.cfg.rpc_url:
+            return None
+        try:
+            from web3 import Web3
+            if self._w3 is None:
+                self._w3 = Web3(Web3.HTTPProvider(self.cfg.rpc_url, request_kwargs={"timeout": 10}))
+            from .evm import ERC20_ABI
+            c = self._w3.eth.contract(address=Web3.to_checksum_address(token), abi=ERC20_ABI)
+            return float(c.functions.balanceOf(Web3.to_checksum_address(wallet)).call())
+        except Exception:
+            return None
 
     def advance(self) -> None:
         pass
@@ -384,7 +455,8 @@ class DexScreenerFeed:
             chunk = ",".join(addresses[i:i + 30])
             data = self.http.get_json(f"{self.DEX}/tokens/v1/{self.chain}/{chunk}")
             pairs = data.get("pairs") if isinstance(data, dict) else data
-            out.update(parse_dexscreener_pairs(pairs, self.now(), self.chain, self.cfg.allowed_dex_ids))
+            out.update(parse_dexscreener_pairs(pairs, self.now(), self.chain, self.cfg.allowed_dex_ids,
+                                               skip_v3=self.chain != "solana"))
         return out
 
     def safety(self, address: str) -> SafetyReport:
@@ -396,7 +468,7 @@ class DexScreenerFeed:
                 rep = parse_rugcheck(self.http.get_json(self.RUG.format(address)))
             else:
                 url = self.GOPLUS.format(self.GOPLUS_CHAIN[self.chain], address)
-                rep = parse_goplus(self.http.get_json(url), address)
+                rep = parse_goplus(self.http.get_json(url), address, min_lock_days=self.cfg.min_lp_lock_days)
         except FeedError:
             rep = SafetyReport(available=False)   # fail closed: auditor will block
         self._safety[address] = (time.time(), rep)

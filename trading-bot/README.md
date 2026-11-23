@@ -1,8 +1,8 @@
 # DEX trading bot: MetaMask wallet, no exchange accounts
 
 A multi-agent meme-coin trading bot, modeled on the "Grok Bot Terminal"
-dashboards on social media. It trades **only on decentralized exchanges**
-(PancakeSwap on BNB Chain by default) **straight from a MetaMask wallet
+videos on social media. It trades **only on a decentralized exchange**
+(PancakeSwap on BNB Chain, paying in USDT) **straight from a MetaMask wallet
 account**. No exchange sign-up, username or password, and nobody holds your
 funds but you.
 
@@ -10,71 +10,99 @@ funds but you.
 
 ## Read this first
 
-- The viral videos are labeled *"Contains AI-generated media"*. $50 to $2,833
-  overnight is not a realistic expectation.
+- The viral videos are labeled *"Contains AI-generated media"*, and their own
+  "trade-level detail" is marked illustrative. Pasting that prompt into a
+  chatbot does not trade anything: the chatbot invents the log.
 - Most new meme coins go to zero, many are built to steal from buyers, and
-  professional bots are faster than this one. **Only trade money you can lose
+  professional bots are faster than this one. **Only put in money you can lose
   completely.**
-- The safety checks (honeypot, tax, mint, locked liquidity, holder
-  concentration) catch a lot, not everything. Scams that pass every check exist.
-- Slippage tolerance (8% on buys) leaves room for "sandwich" bots to take a
-  cut of some trades. Lower `buy_slippage_pct` to reduce that; more buys will
-  then fail.
+- The default sizing (**20–40% of your balance per trade**) is aggressive: two
+  stopped-out trades cost ~7% of the account, and a scam that slips past the
+  checks can take a third of it in one go. Lower `min_position_pct` /
+  `max_position_pct` if that's more than you want.
 
-## How it works: 10 agents
+## The rules it follows
+
+**Universe:** launched or migrated in the last 6 hours, liquidity ≥ $40k,
+5-minute volume ≥ $25k, ≥ 300 holders.
 
 | Agent | Job |
 |---|---|
-| Launch Radar | Finds new tokens on DexScreener |
-| Whale Watch | Buy vs sell flow over 5 min (buys/sells >= 1.3) |
-| Sentiment | Volume acceleration (5m pace vs 1h average): a stand-in for hype, since there is no free X/Telegram feed |
-| LP Auditor | GoPlus security scan: blocks honeypots, tax > 10%, owner-changeable tax, hidden owner, mintable, pausable, unverified source, < 50% of liquidity locked. **Blocks if the scan can't be fetched** |
-| Holder Map | Blocks if top-10 wallets own > 35% |
-| Risk Sizer | 2–4% of balance per trade (less when volatile) |
-| Sniper | Executes the buy |
-| Profit Taker | Sells 50% at 2x and 60% of the rest at 5x, then rides the remainder |
-| Stop Guard | -12% hard stop, -22% trailing stop after 1.3x, exits after 45 min going nowhere, exits if liquidity is pulled |
-| Journal | Logs every decision and trade to `logs/` |
+| Launch Radar | Finds new BNB Chain tokens on DexScreener. Flags only, never trades |
+| Whale Watch | Signal 1: buys are ≥ 70% of the last 5 min of trades |
+| Sentiment | Signal 2: 5-min volume ≥ 5× its 1-hour average (stand-in for hype; there's no free X/Telegram feed) |
+| LP Auditor | GoPlus security scan. Blocks honeypots, tax > 10%, owner-changeable tax, hidden owner, mintable, pausable, unverified code, and pools where < 50% of liquidity is burned or locked for 30+ days. **Blocks if the scan can't be fetched** |
+| Holder Map | Blocks if top-10 wallets own > 35%, the dev wallet owns > 5%, or there are < 300 holders |
+| Risk Sizer | 20–40% of current balance (less when volatile). **Halves after 2 losses in a row** until a win. Profits compound into the next size |
+| Sniper | Buys in **2 parts**. Part 2 goes in only if the price is between -5% and +20% of part 1 |
+| Profit Taker | Sells **40% at 2x, 30% at 4x**; the last 30% rides with a 25% trailing stop |
+| Stop Guard | Hard stop -12%, trailing -25% (after 1.3x), exits after 25 min going nowhere, **exits immediately if the dev wallet sells or liquidity drops 50%** |
+| Journal | Logs every buy, sell and skip with its reason, size, price and profit/loss |
 
-Portfolio limits: max 3 open positions, no new buys after -15% in a day,
-none at all after -40% overall.
+Also:
+- Enters only when **both signals** fire and the safety checks pass.
+- **No chasing:** skips coins already up 300% in the last hour that haven't
+  pulled back.
+- Max 2 open positions.
+- **Pauses buying for the day after a 30% drop from the day's high.**
+
+The morning recap (`logs/session-*/summary.md`) shows start vs end balance,
+best and worst trade, trade count, and the 3 coins that made the most.
 
 ### Live-trading protections
 
 - Off unless `"live_enabled": true` is in your config file **and** you type
   `TRADE` at startup.
-- **Max $10 per trade and $50 of buys per day** by default (`max_live_trade_usd`,
-  `max_live_daily_spend_usd`).
+- Hard dollar caps on top of the % sizing: **$50 per buy, $300 of buys per
+  day** by default (`max_live_trade_usd`, `max_live_daily_spend_usd`).
 - Every swap is dry-run first. A swap that would fail (a honeypot, or a price
-  that moved too far) is never sent, so it costs no gas.
+  that moved more than the 2.5% slippage limit) is never sent, so it costs no
+  gas.
 - Exact-amount token approvals only. It never grants unlimited spending.
-- Checks that it's connected to the right chain (56 = BNB Chain) before
-  sending anything. Gas price capped at 5 gwei.
-- Keeps some BNB in reserve for gas so it can always sell.
+- Checks it's connected to BNB Chain (chain 56) before sending anything. Gas
+  price capped.
+- Keeps 0.005 BNB in reserve for gas, so it can always sell.
+- Stop-loss sells allow up to 15% slippage so they go through in a crash.
+  Buys and take-profits use 2.5%.
 - **Kill switch:** create a file named `STOP` in the bot folder. It sells
   everything and stops buying.
 - Open positions are saved to `live_state.json` and picked up again after a
   restart.
 
-## Setup
+## Setup on Windows with WSL
 
-You need Python 3.10 or newer.
+Open your **Ubuntu (WSL)** terminal and run these once:
 
 ```bash
-cd trading-bot
+sudo apt update && sudo apt install -y python3 python3-pip python3-venv git
+git clone https://github.com/Astevens1976/Galileo.git
+cd Galileo/trading-bot
+git checkout claude/automated-trading-bot-testnet-thvq6g
+python3 -m venv .venv
+source .venv/bin/activate
 pip install -r requirements.txt
 ```
+
+Every time you open a new terminal later:
+
+```bash
+cd ~/Galileo/trading-bot && source .venv/bin/activate
+```
+
+The dashboard runs at **http://127.0.0.1:8787**. Open that in your normal
+Windows browser while the bot is running.
 
 ### Step 1: Practice with fake money (no wallet needed)
 
 ```bash
-python3 -m tradebot                          # simulated market, dashboard at http://127.0.0.1:8787
-python3 -m tradebot --mode paper             # REAL BNB Chain market data, fake $1,000
+python3 -m tradebot                          # simulated market + dashboard
+python3 -m tradebot --mode paper             # REAL BNB Chain market data, fake $100
+python3 -m tradebot --mode paper --balance 70  # pick your fake starting balance
 ```
 
-Run `--mode paper` for **2–4 weeks**. Each session writes
-`logs/session-*/summary.md` and `trades.csv`. Only continue if it's
-profitable after costs, and not just because of one lucky trade.
+Run `--mode paper` overnight, many nights, for **2–4 weeks**. Read
+`logs/session-*/summary.md` each morning. Only move on if it's profitable
+after costs, and not because of one lucky coin.
 
 ### Step 2: Make a separate bot account in MetaMask
 
@@ -82,54 +110,50 @@ profitable after costs, and not just because of one lucky trade.
    "Trading bot". Never use your main account.
 2. On the new account, open **Account details**, then **Show private key**,
    enter your MetaMask password, and copy the key.
-3. In the `trading-bot` folder, create a file named `.env` containing one line:
+3. In the `trading-bot` folder, create the key file:
+   ```bash
+   nano .env
    ```
-   BOT_PRIVATE_KEY=0xPASTE_YOUR_KEY_HERE
-   ```
-   That file is git-ignored. Never share it, paste it into a website or chat,
+   Type `BOT_PRIVATE_KEY=` and paste the key right after it, then press
+   Ctrl+O, Enter, Ctrl+X. Then run `chmod 600 .env`.
+
+   The file is git-ignored. Never share it, paste it into a website or chat,
    or commit it. Anyone with this key controls that account.
 
-The bot account stays a normal MetaMask account. You can see its balances and
-send funds back to your main account any time.
+The bot account stays a normal MetaMask account. You can watch it and send
+funds back to your main account any time.
 
-### Step 3: Test real swaps with free test coins (BNB Chain testnet)
+### Step 3: Test real swaps with free test coins
 
 1. In MetaMask, turn on **Show test networks** and select **BNB Chain Testnet**.
-   If it isn't listed, add it manually: chain ID `97`, RPC
+   If it isn't listed, add it: chain ID `97`, RPC
    `https://data-seed-prebsc-1-s1.bnbchain.org:8545`, symbol `tBNB`.
 2. Get free tBNB for the bot account from the BNB Chain testnet faucet.
-3. Run:
-   ```bash
-   python3 -m tradebot --selftest
-   ```
-   It wraps 0.001 tBNB, buys a token on PancakeSwap testnet, sells it back,
-   and prints `PASS` with the transaction hashes. You can look them up on
-   testnet.bscscan.com.
+3. Run `python3 -m tradebot --selftest`. It buys a token on PancakeSwap
+   testnet, sells it back, and prints `PASS` with the transaction hashes.
 
-### Step 4: Real money, small
+### Step 4: Real money
 
-1. Send the bot account **USDT on BNB Chain (BEP-20)** plus about **0.02 BNB**
-   for gas. USDT on Ethereum (ERC-20) is a different token and won't show up.
-   Use MetaMask's Bridge feature if your USDT is on another chain.
-2. Run a $1 round trip (USDT to WBNB and back) to confirm everything:
-   ```bash
-   python3 -m tradebot --selftest --network mainnet
-   ```
+1. **Get USDT onto BNB Chain.** USDT on Arbitrum or Ethereum is a different
+   token and the bot won't see it. Use **Bridge** in MetaMask to move USDT
+   from Arbitrum to **BNB Chain (BEP-20)**, sending it to the bot account.
+   Also send about **0.02 BNB** to the bot account for gas.
+2. Run a $1 round trip (USDT to WBNB and back):
+   `python3 -m tradebot --selftest --network mainnet`
 3. Start live trading:
    ```bash
    cp config.live.example.json config.json      # edit the limits if you like
    python3 -m tradebot --mode live --config config.json
    ```
-   Keep the computer awake and online. To stop buying and sell everything,
-   create a file named `STOP` in the folder (or press Ctrl+C: open positions
-   stay in the wallet and are managed again on restart).
+   Keep the computer awake and online: in Windows power settings, set
+   sleep to *Never* while it runs. To stop buying and sell everything, open a
+   second WSL terminal in the folder and run `touch STOP`. Ctrl+C also stops
+   it; open positions stay in the wallet and are managed again on restart.
 
 ## Settings
 
-Every setting is in `config.example.json`. Copy what you want to change into
-`config.json` and pass `--config config.json`. Other EVM chains work by
-changing `chain`, `rpc_url`, `expected_chain_id`, `router_address` and
-`quote_token_address` (any Uniswap-V2-style router).
+Every setting is listed in `config.example.json`. Put the ones you want to
+change into `config.json` and pass `--config config.json`.
 
 ## Testing
 
@@ -139,15 +163,15 @@ python3 -m pytest -q
 ```
 
 `tests/test_live_chain.py` starts a private in-memory blockchain, deploys the
-official Uniswap V2 contracts (PancakeSwap V2 is a fork of them) and three
+official Uniswap V2 contracts (PancakeSwap V2 is a copy of them) and three
 test tokens (normal, 5% tax, honeypot). It then runs the real live-trading
-code against them: buys, partial and full sells, the take-profit ladder,
-trailing stop, kill switch, daily cap, slippage refusal, honeypot detection
-and restart recovery.
+code against them: split buys, partial and full sells, the take-profit
+ladder, trailing stop, kill switch, daily cap, slippage refusal, honeypot
+detection and restart recovery.
 
-What hasn't been checked against the real network yet: the BNB Chain
-endpoints, DexScreener and GoPlus responses, and the PancakeSwap testnet
-router address. That's what `--selftest` and `--mode paper` are for, and why
-they come before real money.
+What hasn't been checked against the real network yet: BNB Chain itself,
+DexScreener and GoPlus responses, and the PancakeSwap testnet router address.
+That's what `--mode paper` and `--selftest` are for, and why they come before
+real money.
 
 `trades.csv` records every fill. Keep it for your tax records.
