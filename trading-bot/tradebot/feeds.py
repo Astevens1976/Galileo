@@ -1,8 +1,9 @@
 """Market data feeds.
 
 SimFeed       - synthetic Solana meme-coin market. Offline, seeded, fast.
-DexScreenerFeed - real Solana data from DexScreener (prices, liquidity, flow)
-                  plus RugCheck (mint / freeze authority, LP lock, holders).
+
+DexScreenerFeed - real data on any DexScreener chain (prices, liquidity, flow)
+                  + safety checks: RugCheck on Solana, GoPlus on EVM chains.
 
 Both expose the same interface:
     advance()                -> move the clock (sim) / no-op (live data)
@@ -195,7 +196,7 @@ class SimFeed:
 
 
 # ============================================================================
-# Real market data: DexScreener + RugCheck (no API keys needed)
+# Real market data: DexScreener + RugCheck (Solana) / GoPlus (EVM). No API keys.
 # ============================================================================
 
 class _Http:
@@ -226,11 +227,19 @@ def _f(v, default=0.0) -> float:
         return default
 
 
-def parse_dexscreener_pairs(pairs, now: float) -> dict[str, TokenSnapshot]:
-    """Best-liquidity Solana pair per base token -> TokenSnapshot."""
+def parse_dexscreener_pairs(pairs, now: float, chain: str = "solana",
+                            allowed_dex=()) -> dict[str, TokenSnapshot]:
+    """Best-liquidity tradable pair per base token -> TokenSnapshot.
+
+    allowed_dex limits to DEXes we can execute on (e.g. pancakeswap); V3/V4
+    pools are skipped because execution goes through a V2 router."""
     best: dict[str, tuple[float, dict]] = {}
     for p in pairs or []:
-        if p.get("chainId") != "solana":
+        if p.get("chainId") != chain:
+            continue
+        if allowed_dex and p.get("dexId") not in allowed_dex:
+            continue
+        if {"v3", "v4"} & {str(x).lower() for x in (p.get("labels") or [])}:
             continue
         addr = (p.get("baseToken") or {}).get("address")
         liq = _f((p.get("liquidity") or {}).get("usd"))
@@ -253,8 +262,64 @@ def parse_dexscreener_pairs(pairs, now: float) -> dict[str, TokenSnapshot]:
             volume_5m_usd=_f(vol.get("m5")),
             volume_1h_usd=_f(vol.get("h1")),
             price_change_5m_pct=_f((p.get("priceChange") or {}).get("m5")),
+            pair_address=p.get("pairAddress") or "",
+            quote_address=(p.get("quoteToken") or {}).get("address") or "",
+            dex_id=p.get("dexId") or "",
         )
     return out
+
+
+_DEAD = {"0x0000000000000000000000000000000000000000", "0x000000000000000000000000000000000000dead"}
+
+
+def parse_goplus(data: dict, address: str) -> SafetyReport:
+    """GoPlus token security (EVM chains). Unknown answers count against the token."""
+    res = (data or {}).get("result") or {}
+    t = res.get(address.lower()) or (next(iter(res.values())) if res else None)
+    if not t:
+        return SafetyReport(available=False)
+
+    def flag(k):
+        return str(t.get(k, "0")) == "1"
+
+    rep = SafetyReport(mint_authority=flag("is_mintable"), freeze_authority=flag("transfer_pausable"),
+                       lp_unlocked=False)
+    checks = [
+        ("is_honeypot", "honeypot: cannot sell"),
+        ("cannot_sell_all", "cannot sell full balance"),
+        ("hidden_owner", "hidden owner"),
+        ("can_take_back_ownership", "owner can reclaim ownership"),
+        ("owner_change_balance", "owner can change balances"),
+        ("selfdestruct", "contract can self-destruct"),
+        ("slippage_modifiable", "owner can change the tax"),
+        ("personal_slippage_modifiable", "owner can set per-wallet tax"),
+        ("is_proxy", "upgradeable proxy contract"),
+    ]
+    for key, label in checks:
+        if flag(key):
+            rep.dangers.append(label)
+    if str(t.get("is_open_source", "0")) != "1":
+        rep.dangers.append("source code not verified")
+    for key, label in (("is_blacklisted", "has blacklist"), ("trading_cooldown", "trading cooldown"),
+                       ("external_call", "external calls")):
+        if flag(key):
+            rep.warnings.append(label)
+    for key, attr in (("buy_tax", "buy_tax_pct"), ("sell_tax", "sell_tax_pct")):
+        v = t.get(key)
+        if v in (None, ""):
+            rep.dangers.append(f"{key.replace('_', ' ')} unknown")
+        else:
+            setattr(rep, attr, _f(v) * 100)
+    lp = t.get("lp_holders") or []
+    if lp:
+        rep.lp_locked_pct = 100 * sum(_f(h.get("percent")) for h in lp
+                                      if str(h.get("is_locked")) == "1" or str(h.get("address", "")).lower() in _DEAD)
+    holders = [h for h in (t.get("holders") or [])
+               if str(h.get("is_contract")) != "1" and str(h.get("is_locked")) != "1"
+               and str(h.get("address", "")).lower() not in _DEAD]
+    if holders:
+        rep.top10_pct = 100 * sum(_f(h.get("percent")) for h in holders[:10])
+    return rep
 
 
 def parse_rugcheck(data: dict) -> SafetyReport:
@@ -280,12 +345,17 @@ def parse_rugcheck(data: dict) -> SafetyReport:
 
 
 class DexScreenerFeed:
-    name = "dexscreener"
     DEX = "https://api.dexscreener.com"
     RUG = "https://api.rugcheck.xyz/v1/tokens/{}/report/summary"
+    GOPLUS = "https://api.gopluslabs.io/api/v1/token_security/{}?contract_addresses={}"
+    GOPLUS_CHAIN = {"bsc": 56, "ethereum": 1, "base": 8453, "arbitrum": 42161, "polygon": 137}
 
     def __init__(self, cfg: Config):
         self.cfg = cfg
+        self.chain = cfg.chain
+        self.name = f"dexscreener/{cfg.chain}"
+        if self.chain != "solana" and self.chain not in self.GOPLUS_CHAIN:
+            raise ValueError(f"no safety-check source for chain {self.chain!r}")
         self.http = _Http()
         self._seen: set[str] = set()
         self._safety: dict[str, tuple[float, SafetyReport]] = {}
@@ -302,7 +372,7 @@ class DexScreenerFeed:
             data = self.http.get_json(self.DEX + path)
             for item in data if isinstance(data, list) else []:
                 addr = item.get("tokenAddress")
-                if item.get("chainId") == "solana" and addr and addr not in self._seen:
+                if item.get("chainId") == self.chain and addr and addr not in self._seen:
                     self._seen.add(addr)
                     new.append(addr)
         return new
@@ -312,9 +382,9 @@ class DexScreenerFeed:
         out: dict[str, TokenSnapshot] = {}
         for i in range(0, len(addresses), 30):
             chunk = ",".join(addresses[i:i + 30])
-            data = self.http.get_json(f"{self.DEX}/tokens/v1/solana/{chunk}")
+            data = self.http.get_json(f"{self.DEX}/tokens/v1/{self.chain}/{chunk}")
             pairs = data.get("pairs") if isinstance(data, dict) else data
-            out.update(parse_dexscreener_pairs(pairs, self.now()))
+            out.update(parse_dexscreener_pairs(pairs, self.now(), self.chain, self.cfg.allowed_dex_ids))
         return out
 
     def safety(self, address: str) -> SafetyReport:
@@ -322,7 +392,11 @@ class DexScreenerFeed:
         if hit and time.time() - hit[0] < 600:
             return hit[1]
         try:
-            rep = parse_rugcheck(self.http.get_json(self.RUG.format(address)))
+            if self.chain == "solana":
+                rep = parse_rugcheck(self.http.get_json(self.RUG.format(address)))
+            else:
+                url = self.GOPLUS.format(self.GOPLUS_CHAIN[self.chain], address)
+                rep = parse_goplus(self.http.get_json(url), address)
         except FeedError:
             rep = SafetyReport(available=False)   # fail closed: auditor will block
         self._safety[address] = (time.time(), rep)

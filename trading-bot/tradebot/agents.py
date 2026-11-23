@@ -25,7 +25,7 @@ class Agent:
 
 
 class LaunchRadar(Agent):
-    name, badge, blurb = "Launch Radar", "SCAN", "new Solana launches (DexScreener)"
+    name, badge, blurb = "Launch Radar", "SCAN", "new launches (DexScreener)"
 
 
 class WhaleWatch(Agent):
@@ -54,7 +54,7 @@ class Sentiment(Agent):
 
 
 class LPAuditor(Agent):
-    name, badge, blurb = "LP Auditor", "AUDIT", "LP lock / mint / freeze"
+    name, badge, blurb = "LP Auditor", "AUDIT", "honeypot / tax / LP lock / mint"
 
     def evaluate(self, s: TokenSnapshot, r: SafetyReport) -> tuple[bool, str]:
         c = self.cfg
@@ -66,6 +66,10 @@ class LPAuditor(Agent):
             why = "freeze authority enabled"
         elif c.block_lp_unlocked and r.lp_unlocked:
             why = "LP unlocked"
+        elif c.block_lp_unlocked and r.lp_locked_pct is not None and r.lp_locked_pct < c.min_lp_locked_pct:
+            why = f"only {r.lp_locked_pct:.0f}% of LP locked"
+        elif max(r.buy_tax_pct or 0, r.sell_tax_pct or 0) > c.max_tax_pct:
+            why = f"tax {r.buy_tax_pct or 0:.0f}% buy / {r.sell_tax_pct or 0:.0f}% sell"
         elif r.dangers:
             why = r.dangers[0]
         else:

@@ -16,6 +16,9 @@ class TokenSnapshot:
     volume_5m_usd: float = 0.0
     volume_1h_usd: float = 0.0
     price_change_5m_pct: float = 0.0
+    pair_address: str = ""
+    quote_address: str = ""
+    dex_id: str = ""
 
 
 @dataclass
@@ -25,6 +28,9 @@ class SafetyReport:
     freeze_authority: bool | None = None
     lp_unlocked: bool | None = None
     top10_pct: float | None = None
+    lp_locked_pct: float | None = None
+    buy_tax_pct: float | None = None
+    sell_tax_pct: float | None = None
     dangers: list[str] = field(default_factory=list)
     warnings: list[str] = field(default_factory=list)
 
@@ -43,6 +49,7 @@ class Position:
     proceeds_usd: float = 0.0   # USDT received from partial sells so far
     ladder_hits: int = 0
     missing_ticks: int = 0
+    sell_failures: int = 0
 
 
 @dataclass

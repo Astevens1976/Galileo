@@ -2,10 +2,10 @@ import pytest
 
 from tradebot.__main__ import main
 from tradebot.agents import LPAuditor, ProfitTaker, StopGuard
-from tradebot.broker import LiveBroker, PaperBroker, pool_impact
+from tradebot.broker import PaperBroker, pool_impact
 from tradebot.config import Config, load_config
 from tradebot.engine import Engine
-from tradebot.feeds import SimFeed, parse_dexscreener_pairs, parse_rugcheck
+from tradebot.feeds import SimFeed, parse_dexscreener_pairs, parse_goplus, parse_rugcheck
 from tradebot.models import SafetyReport, TokenSnapshot
 
 
@@ -102,10 +102,9 @@ def test_daily_loss_halt_stops_new_entries():
     assert e.stats["checked"] == before
 
 
-def test_live_mode_is_locked(capsys):
+def test_live_mode_refuses_unless_enabled_in_config(capsys):
     assert main(["--mode", "live", "--no-logs"]) == 2
-    with pytest.raises(RuntimeError):
-        LiveBroker(Config())
+    assert "live_enabled" in capsys.readouterr().out
 
 
 def test_config_rejects_unknown_keys():
@@ -123,7 +122,7 @@ def test_parse_dexscreener_picks_deepest_solana_pair():
          "txns": {"m5": {"buys": 40, "sells": 20}}, "volume": {"m5": 9000, "h1": 30000}, "priceChange": {"m5": 7}},
         {"chainId": "base", "baseToken": {"address": "X"}, "priceUsd": "1"},
     ]
-    out = parse_dexscreener_pairs(pairs, now=600)
+    out = parse_dexscreener_pairs(pairs, now=600, chain="solana")
     assert list(out) == ["M1"]
     s = out["M1"]
     assert s.liquidity_usd == 50000 and s.market_cap_usd == 110000 and s.buys_5m == 40
@@ -139,3 +138,40 @@ def test_parse_rugcheck_flags():
     assert rep.freeze_authority and rep.lp_unlocked and not rep.mint_authority
     assert rep.top10_pct == pytest.approx(41.5)
     assert len(rep.dangers) == 2
+
+
+def test_parse_dexscreener_keeps_only_executable_bsc_pools():
+    def pair(dex, labels, liq):
+        return {"chainId": "bsc", "dexId": dex, "labels": labels, "pairAddress": f"P{liq}",
+                "baseToken": {"address": "0xT", "symbol": "T"}, "quoteToken": {"address": "0xQ"},
+                "priceUsd": "1", "liquidity": {"usd": liq}}
+    pairs = [pair("pancakeswap", ["v3"], 900_000), pair("uniswap", [], 800_000),
+             pair("pancakeswap", ["v2"], 50_000)]
+    s = parse_dexscreener_pairs(pairs, 0, "bsc", ["pancakeswap"])["0xT"]
+    assert s.pair_address == "P50000" and s.quote_address == "0xQ" and s.dex_id == "pancakeswap"
+
+
+def test_parse_goplus():
+    clean = {"result": {"0xabc": {
+        "is_open_source": "1", "is_honeypot": "0", "buy_tax": "0.03", "sell_tax": "0.05",
+        "lp_holders": [{"address": "0x000000000000000000000000000000000000dead", "percent": "0.6"},
+                       {"address": "0x1", "percent": "0.3", "is_locked": 1}],
+        "holders": [{"address": "0xpair", "percent": "0.5", "is_contract": 1},
+                    {"address": "0xw1", "percent": "0.08"}, {"address": "0xw2", "percent": "0.04"}]}}}
+    r = parse_goplus(clean, "0xABC")
+    assert r.available and not r.dangers
+    assert r.buy_tax_pct == pytest.approx(3) and r.sell_tax_pct == pytest.approx(5)
+    assert r.lp_locked_pct == pytest.approx(90) and r.top10_pct == pytest.approx(12)
+
+    bad = {"result": {"0xabc": {"is_open_source": "0", "is_honeypot": "1", "buy_tax": "", "sell_tax": "0.4"}}}
+    r = parse_goplus(bad, "0xabc")
+    assert {"honeypot: cannot sell", "source code not verified", "buy tax unknown"} <= set(r.dangers)
+    assert not LPAuditor(Config()).evaluate(snap(), r)[0]
+    assert not parse_goplus({"result": {}}, "0xabc").available
+
+
+def test_auditor_blocks_high_tax_and_unlocked_lp():
+    a = LPAuditor(Config())
+    assert "tax" in a.evaluate(snap(), SafetyReport(buy_tax_pct=2, sell_tax_pct=15))[1]
+    assert "LP locked" in a.evaluate(snap(), SafetyReport(lp_locked_pct=20))[1]
+    assert a.evaluate(snap(), SafetyReport(buy_tax_pct=2, sell_tax_pct=3, lp_locked_pct=95))[0]

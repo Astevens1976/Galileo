@@ -1,6 +1,7 @@
 """Main loop: RADAR -> FLOW/HYPE -> AUDIT -> HOLDERS -> SIZE -> SNIPE, then TAKE/STOP."""
 from __future__ import annotations
 
+import os
 import threading
 import time
 from collections import deque
@@ -88,6 +89,7 @@ class Engine:
             self.marks[a] = s.price_usd
 
         self._manage_positions(snaps, now)
+        self._kill_switch(now, snaps)
         self._risk_guard(now)
         if not self.halted:
             self._scan(snaps, now)
@@ -107,19 +109,26 @@ class Engine:
             if s is None:
                 pos.missing_ticks += 1
                 if pos.missing_ticks >= 6:
-                    self._record(self.broker.write_off(addr, now), "token vanished: written off", "stop")
+                    fill = self.broker.write_off(addr, now)
+                    self._record(fill, "token vanished from feed: exited", "stop") if fill else self._sell_failed(addr, now)
                 continue
             pos.missing_ticks = 0
             pos.last_price = s.price_usd
             pos.peak_price = max(pos.peak_price, s.price_usd)
             reason = self.stop.check(pos, s, now)
             if reason:
-                self._record(self.broker.sell(addr, 1.0, s, now), reason, "stop")
+                fill = self.broker.sell(addr, 1.0, s, now)
+                self._record(fill, reason, "stop") if fill else self._sell_failed(addr, now)
                 continue
             tp = self.taker.check(pos, s)
             if tp:
                 frac, reason = tp
-                self._record(self.broker.sell(addr, frac, s, now), reason, "sell")
+                fill = self.broker.sell(addr, frac, s, now)
+                if fill:
+                    self._record(fill, reason, "sell")
+                else:
+                    pos.ladder_hits -= 1          # retry this rung next tick
+                    self._sell_failed(addr, now)
 
     # --------------------------------------------------------------- entries
     def _scan(self, snaps: dict[str, TokenSnapshot], now: float) -> None:
@@ -157,6 +166,7 @@ class Engine:
             report = self.feed.safety(a)
         except FeedError:
             report = SafetyReport(available=False)
+        self.broker.remember_safety(a, report)
         for agent in (self.lp, self.holders):
             ok, why = agent.evaluate(s, report)
             if not ok:
@@ -171,12 +181,40 @@ class Engine:
             self.next_eval[a] = now + self.cfg.reevaluate_after_min * 60
             self._pipe(s, "skipped", f"size ${usd:.2f} too small")
             return
+        ok, why = self.broker.can_trade(s)
+        if not ok:
+            self.next_eval[a] = now + self.cfg.reevaluate_after_min * 60
+            self._pipe(s, "skipped", why)
+            return
         fill = self.broker.buy(s, usd, now, flow)
+        if not fill and self.broker.last_error.startswith("daily"):
+            self._halt(now, "daily live spend cap reached")   # resets at the next UTC day
+            return
+        if not fill and self.broker.last_error:
+            self.done.add(a)
+            self._pipe(s, "skipped", self.broker.last_error[:80])
+            self._event(now, "error", s.symbol, f"buy not executed: {self.broker.last_error}")
         if fill:
             self.done.add(a)
             self.sniper.touch(f"BUY ${s.symbol} · impact {fill.impact_pct:.2f}%")
             self._pipe(s, "bought", flow)
             self._record(fill, f"{flow} · {size_note}", "buy")
+
+    def _kill_switch(self, now: float, snaps) -> None:
+        path = self.cfg.kill_switch_file
+        if not path or not os.path.exists(path):
+            return
+        if not self.halted or not self.halt_reason.startswith("kill switch"):
+            self._halt(now, f"kill switch file '{path}' found: selling everything")
+        for addr in list(self.broker.positions):
+            s = snaps.get(addr)
+            fill = self.broker.sell(addr, 1.0, s, now) if s else self.broker.write_off(addr, now)
+            self._record(fill, "kill switch", "stop") if fill else self._sell_failed(addr, now)
+
+    def _sell_failed(self, addr: str, now: float) -> None:
+        pos = self.broker.positions.get(addr)
+        if pos and pos.sell_failures in (1, 5, 20, 100):     # don't spam the log
+            self._event(now, "error", pos.symbol, f"sell failed ({pos.sell_failures}x): {self.broker.last_error}")
 
     # ------------------------------------------------------------ risk guard
     def _risk_guard(self, now: float) -> None:
@@ -285,6 +323,8 @@ class Engine:
                 "events": list(self.events)[-40:],
                 "equity_curve": self.equity_curve[::step],
                 "journal_lines": self.journal.lines,
+                "live": getattr(self.broker, "live", False),
+                "wallet": getattr(getattr(self.broker, "client", None), "address", ""),
             }
 
     def summary(self) -> str:

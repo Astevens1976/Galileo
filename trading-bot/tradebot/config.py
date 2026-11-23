@@ -11,9 +11,28 @@ MODES = ("sim", "paper", "live")
 class Config:
     # sim   = synthetic market, fake money (works offline, fast-forward a night in seconds)
     # paper = REAL Solana market data (DexScreener + RugCheck), fake money
-    # live  = real money; locked in this version
+    # live  = REAL money, signed by your dedicated wallet (see README before using)
     mode: str = "sim"
-    starting_balance_usdt: float = 1000.0
+    starting_balance_usdt: float = 1000.0   # paper/sim only; live uses your on-chain balance
+
+    # --- chain / DEX -------------------------------------------------------------
+    chain: str = "bsc"                    # DexScreener chain id: bsc | base | ethereum | arbitrum | solana
+    allowed_dex_ids: list = field(default_factory=lambda: ["pancakeswap"])   # [] = any
+    rpc_url: str = "https://bsc-dataseed.bnbchain.org"
+    expected_chain_id: int = 56
+    router_address: str = "0x10ED43C718714eb63d5aA57B78B54704E256024E"        # PancakeSwap V2
+    quote_token_address: str = "0x55d398326f99059fF775485246999027B3197955"   # USDT (BEP-20)
+
+    # --- live-trading guard rails ----------------------------------------------
+    live_enabled: bool = False            # must ALSO be true in your config file to trade live
+    max_live_trade_usd: float = 10.0
+    max_live_daily_spend_usd: float = 50.0
+    max_gas_gwei: float = 5.0
+    min_gas_reserve_native: float = 0.005  # keep this much BNB for gas, always
+    buy_slippage_pct: float = 8.0
+    exit_slippage_pct: float = 20.0       # exits must go through in a falling market
+    live_state_file: str = "live_state.json"
+    kill_switch_file: str = "STOP"        # create this file to halt and sell everything
 
     # --- cheap pre-filters (no API cost) -------------------------------------
     min_liquidity_usd: float = 15_000
@@ -33,6 +52,8 @@ class Config:
     block_freeze_authority: bool = True
     block_lp_unlocked: bool = True
     max_top10_pct: float = 35
+    max_tax_pct: float = 10               # EVM tokens can charge a tax on buys/sells
+    min_lp_locked_pct: float = 50         # EVM: share of LP tokens locked or burned
 
     # --- sizing / portfolio risk ---------------------------------------------
     min_position_pct: float = 2.0

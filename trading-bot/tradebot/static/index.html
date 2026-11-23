@@ -129,8 +129,9 @@ const KIND = {buy: ["BUY", "var(--amber)"], sell: ["SELL", "var(--green)"], stop
 function render(s) {
   const st = s.stats;
   $("mode").textContent = s.mode === "live" ? "LIVE · real money" : s.mode.toUpperCase() + " · fake money";
+  $("mode").className = "pill " + (s.mode === "live" ? "r" : "a");
   const hrs = ((s.now - s.started_at) / 3600).toFixed(1);
-  $("meta").textContent = `feed ${s.feed} · ${clock(s.now)} UTC · ${hrs}h · ${s.launches} launches · watching ${s.watching}` + (s.errors ? ` · ${s.errors} feed errors` : "");
+  $("meta").textContent = `feed ${s.feed} · ${clock(s.now)} UTC · ${hrs}h · ${s.launches} launches · watching ${s.watching}` + (s.wallet ? ` · wallet ${s.wallet.slice(0, 6)}…${s.wallet.slice(-4)}` : "") + (s.errors ? ` · ${s.errors} errors` : "");
   $("headline").textContent = "● " + s.headline;
   const ret = (s.equity / s.start_balance - 1) * 100;
   $("equity").innerHTML = usd(s.equity) + ` <small class="${ret >= 0 ? "g" : "r"}" style="font-size:12px">${ret >= 0 ? "+" : ""}${ret.toFixed(1)}%</small>`;

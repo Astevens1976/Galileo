@@ -1,0 +1,11 @@
+{
+  "mode": "live",
+  "chain": "bsc",
+  "live_enabled": true,
+  "max_live_trade_usd": 10.0,
+  "max_live_daily_spend_usd": 50.0,
+  "max_open_positions": 3,
+  "max_daily_loss_pct": 15.0,
+  "hard_stop_pct": 12.0,
+  "trailing_stop_pct": 22.0
+}
