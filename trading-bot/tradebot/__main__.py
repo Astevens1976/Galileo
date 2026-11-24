@@ -9,6 +9,7 @@
 from __future__ import annotations
 
 import argparse
+import os
 import sys
 import threading
 
@@ -41,6 +42,9 @@ def main(argv=None) -> int:
     ap.add_argument("--headless", action="store_true", help="no dashboard")
     ap.add_argument("--hours", type=float, help="sim: market hours to run, then stop")
     ap.add_argument("--no-logs", action="store_true")
+    ap.add_argument("--data-dir", default=os.environ.get("ADAMS_BOT_DIR"),
+                    help='folder for logs, trades and live state, e.g. "/mnt/g/Adams Bot" '
+                         "(default: $ADAMS_BOT_DIR, else this folder)")
     ap.add_argument("--env-file", default=".env", help="file holding BOT_PRIVATE_KEY")
     ap.add_argument("--yes", action="store_true", help="live: skip the typed confirmation")
     ap.add_argument("--selftest", action="store_true", help="buy and sell back a small amount on-chain")
@@ -52,6 +56,13 @@ def main(argv=None) -> int:
     cfg = load_config(args.config, mode=args.mode, chain=args.chain,
                       starting_balance_usdt=args.starting_balance_usdt, seed=args.seed,
                       dashboard_port=args.dashboard_port, sim_speed=args.sim_speed)
+
+    if args.data_dir:
+        os.makedirs(args.data_dir, exist_ok=True)
+        cfg.log_dir = os.path.join(args.data_dir, "logs")
+        if not os.path.isabs(cfg.live_state_file):
+            cfg.live_state_file = os.path.join(args.data_dir, cfg.live_state_file)
+        print(f"data folder: {args.data_dir}")
 
     if args.selftest:
         from .evm import load_private_key

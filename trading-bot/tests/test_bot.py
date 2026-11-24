@@ -281,3 +281,10 @@ def test_geckoterminal_is_polled_slowly_and_backs_off_on_429(monkeypatch):
     clock[0] += 30
     feed.discover()
     assert gecko() == 3                                   # new_pools retried after 60s, trending still waiting
+
+
+def test_data_dir_puts_logs_there(tmp_path):
+    d = tmp_path / "Adams Bot"
+    assert main(["--headless", "--hours", "0.1", "--seed", "1", "--data-dir", str(d)]) == 0
+    sessions = list((d / "logs").iterdir())
+    assert len(sessions) == 1 and (sessions[0] / "summary.md").exists() and (sessions[0] / "trades.csv").exists()
