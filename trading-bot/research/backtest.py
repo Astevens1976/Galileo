@@ -283,8 +283,31 @@ def run_configs(entry_bar, side, o, c, t, at_sig, tp_hit, sl_hit, tps, sls, hold
 
 
 # --- per-coin study -----------------------------------------------------------
+DEAD_RUN_BARS = 288     # a full day with zero volume = delisted / frozen
+
+
+def load_clean(path: str) -> dict:
+    """Load a coin, keeping only history after its last full day of zero trading.
+
+    Binance sometimes reuses a ticker for a different project (LITUSDT was
+    Litentry until 2025, then Lighter) and pads delisted stretches with flat,
+    zero-volume bars. Everything before the last such stretch is dropped."""
+    z = dict(np.load(path))
+    dead = z["qv"] <= 0
+    start = 0
+    d = np.concatenate([[0], dead.astype(np.int8), [0]])
+    edges = np.flatnonzero(np.diff(d))
+    for b, e in zip(edges[::2], edges[1::2]):
+        if e - b >= DEAD_RUN_BARS:
+            start = e
+    if start:
+        for k in ("t", "o", "h", "l", "c", "qv"):
+            z[k] = z[k][start:]
+    return z
+
+
 def study_symbol(path: str) -> dict:
-    z = np.load(path)
+    z = load_clean(path)
     t, o, h, l, c, qv = z["t"], z["o"], z["h"], z["l"], z["c"], z["qv"]
     ft, fr = z["ft"], z["fr"]
     fcum = np.concatenate([[0.0], np.cumsum(fr)])
