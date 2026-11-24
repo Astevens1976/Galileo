@@ -378,6 +378,33 @@ def parse_goplus(data: dict, address: str, now: float | None = None,
     return rep
 
 
+# Majors that show up as one side of new pools; the meme coin is the other side.
+_MAJORS = {
+    "0xbb4cdb9cbd36b01bd1cbc7bf4de89b5c7a4c1c1b",   # WBNB
+    "0x55d398326f99059ff775485246999027b3197955",   # USDT
+    "0x8ac76a51cc950d9822d68b83fe1ad97b32cd580d",   # USDC
+    "0xe9e7cea3dedca5984780bafc599bd69add087d56",   # BUSD
+    "0x2170ed0880ac9a755fd29b2688956bd959f933f8",   # ETH
+    "so11111111111111111111111111111111111111112",  # wSOL
+}
+
+
+def parse_geckoterminal_pools(data: dict, min_reserve_usd: float = 0) -> list[str]:
+    """Token addresses from a GeckoTerminal pools list (new_pools / trending_pools)."""
+    out = []
+    for pool in (data or {}).get("data") or []:
+        attrs = pool.get("attributes") or {}
+        if _f(attrs.get("reserve_in_usd")) < min_reserve_usd:
+            continue
+        rel = pool.get("relationships") or {}
+        ids = [((rel.get(k) or {}).get("data") or {}).get("id", "") for k in ("base_token", "quote_token")]
+        addrs = [i.split("_", 1)[1] if "_" in i else i for i in ids]
+        pick = next((a for a in addrs if a and a.lower() not in _MAJORS), None)
+        if pick and pick not in out:
+            out.append(pick)
+    return out
+
+
 def parse_rugcheck(data: dict) -> SafetyReport:
     rep = SafetyReport(mint_authority=False, freeze_authority=False, lp_unlocked=False)
     for r in (data or {}).get("risks") or []:
@@ -405,6 +432,8 @@ class DexScreenerFeed:
     RUG = "https://api.rugcheck.xyz/v1/tokens/{}/report/summary"
     GOPLUS = "https://api.gopluslabs.io/api/v1/token_security/{}?contract_addresses={}"
     GOPLUS_CHAIN = {"bsc": 56, "ethereum": 1, "base": 8453, "arbitrum": 42161, "polygon": 137}
+    GECKO = "https://api.geckoterminal.com/api/v2/networks/{}/{}?page=1"
+    GECKO_NET = {"bsc": "bsc", "solana": "solana", "ethereum": "eth", "base": "base", "arbitrum": "arbitrum"}
 
     def __init__(self, cfg: Config):
         self.cfg = cfg
@@ -416,6 +445,7 @@ class DexScreenerFeed:
         self._seen: set[str] = set()
         self._safety: dict[str, tuple[float, SafetyReport]] = {}
         self._w3 = None
+        self.warnings: list[str] = []
 
     def now(self) -> float:
         return time.time()
@@ -438,15 +468,38 @@ class DexScreenerFeed:
         pass
 
     def discover(self) -> list[str]:
-        new = []
+        """New tokens from every source; one source failing doesn't stop the others."""
+        found: list[str] = []
+        errors: list[str] = []
+        net = self.GECKO_NET.get(self.chain)
+        if net:
+            # every newly created pool on the chain, plus what's trending right now
+            for kind in ("new_pools", "trending_pools"):
+                try:
+                    data = self.http.get_json(self.GECKO.format(net, kind))
+                    found += parse_geckoterminal_pools(data, self.cfg.min_liquidity_usd / 4)
+                except FeedError as e:
+                    errors.append(str(e))
         for path in ("/token-profiles/latest/v1", "/token-boosts/latest/v1"):
-            data = self.http.get_json(self.DEX + path)
+            try:
+                data = self.http.get_json(self.DEX + path)
+            except FeedError as e:
+                errors.append(str(e))
+                continue
             for item in data if isinstance(data, list) else []:
-                addr = item.get("tokenAddress")
-                if item.get("chainId") == self.chain and addr and addr not in self._seen:
-                    self._seen.add(addr)
-                    new.append(addr)
+                if item.get("chainId") == self.chain and item.get("tokenAddress"):
+                    found.append(item["tokenAddress"])
+        self.warnings += errors
+        new = []
+        for addr in found:
+            if addr not in self._seen:
+                self._seen.add(addr)
+                new.append(addr)
         return new
+
+    def pop_warnings(self) -> list[str]:
+        w, self.warnings = self.warnings, []
+        return w
 
     def snapshot(self, addresses) -> dict[str, TokenSnapshot]:
         addresses = list(addresses)

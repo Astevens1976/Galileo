@@ -75,6 +75,8 @@ class Engine:
         except FeedError as e:
             new = []
             self._error(now, e)
+        for w in getattr(self.feed, "pop_warnings", lambda: [])():
+            self._error(now, FeedError(w))
         for addr in new:
             self.watch.setdefault(addr, now)
         self.launches_seen += len(new)

@@ -5,7 +5,7 @@ from tradebot.agents import HolderMap, LPAuditor, ProfitTaker, RiskSizer, StopGu
 from tradebot.broker import PaperBroker, pool_impact
 from tradebot.config import Config, load_config
 from tradebot.engine import Engine
-from tradebot.feeds import SimFeed, parse_dexscreener_pairs, parse_goplus, parse_rugcheck
+from tradebot.feeds import SimFeed, parse_dexscreener_pairs, parse_geckoterminal_pools, parse_goplus, parse_rugcheck
 from tradebot.models import SafetyReport, TokenSnapshot
 
 
@@ -241,3 +241,17 @@ def test_drawdown_from_day_peak_pauses_entries():
     e.broker.cash = cfg.starting_balance_usdt * 1.0      # -33% from that high
     e.tick()
     assert e.halted and "today's peak" in e.halt_reason
+
+
+def test_parse_geckoterminal_new_pools_picks_the_meme_side():
+    def pool(base, quote, reserve):
+        return {"attributes": {"reserve_in_usd": str(reserve)},
+                "relationships": {"base_token": {"data": {"id": f"bsc_{base}"}},
+                                  "quote_token": {"data": {"id": f"bsc_{quote}"}}}}
+    wbnb = "0xbb4CdB9CBd36B01bD1cBc7Bf4dE89B5C7a4C1C1b"
+    data = {"data": [pool("0xMEME1", wbnb, 50_000),
+                     pool(wbnb, "0xMEME2", 20_000),        # meme coin on the quote side
+                     pool("0xDUST", wbnb, 300),            # too small
+                     pool("0xMEME1", wbnb, 60_000)]}       # duplicate
+    assert parse_geckoterminal_pools(data, 10_000) == ["0xMEME1", "0xMEME2"]
+    assert parse_geckoterminal_pools({}, 0) == []
