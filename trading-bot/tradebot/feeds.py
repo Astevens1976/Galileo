@@ -433,6 +433,8 @@ class DexScreenerFeed:
     GOPLUS = "https://api.gopluslabs.io/api/v1/token_security/{}?contract_addresses={}"
     GOPLUS_CHAIN = {"bsc": 56, "ethereum": 1, "base": 8453, "arbitrum": 42161, "polygon": 137}
     GECKO = "https://api.geckoterminal.com/api/v2/networks/{}/{}?page=1"
+    GECKO_EVERY = {"new_pools": 30.0, "trending_pools": 120.0}   # seconds; free tier is rate-limited
+    GECKO_MAX_BACKOFF = 600.0
     GECKO_NET = {"bsc": "bsc", "solana": "solana", "ethereum": "eth", "base": "base", "arbitrum": "arbitrum"}
 
     def __init__(self, cfg: Config):
@@ -446,6 +448,8 @@ class DexScreenerFeed:
         self._safety: dict[str, tuple[float, SafetyReport]] = {}
         self._w3 = None
         self.warnings: list[str] = []
+        self._gecko_next: dict[str, float] = {}
+        self._gecko_wait: dict[str, float] = {}
 
     def now(self) -> float:
         return time.time()
@@ -474,12 +478,25 @@ class DexScreenerFeed:
         net = self.GECKO_NET.get(self.chain)
         if net:
             # every newly created pool on the chain, plus what's trending right now
-            for kind in ("new_pools", "trending_pools"):
+            now = time.monotonic()
+            for kind, every in self.GECKO_EVERY.items():
+                if now < self._gecko_next.get(kind, 0):
+                    continue
                 try:
                     data = self.http.get_json(self.GECKO.format(net, kind))
                     found += parse_geckoterminal_pools(data, self.cfg.min_liquidity_usd / 4)
+                    self._gecko_wait[kind] = every
+                    self._gecko_next[kind] = now + every
                 except FeedError as e:
-                    errors.append(str(e))
+                    if "429" in str(e):     # told to slow down: back off, double each time
+                        wait = min(self._gecko_wait.get(kind, every) * 2, self.GECKO_MAX_BACKOFF)
+                        self._gecko_wait[kind] = wait
+                        self._gecko_next[kind] = now + wait
+                        if wait >= self.GECKO_MAX_BACKOFF:
+                            errors.append(f"GeckoTerminal {kind}: still rate-limited, retrying every {wait:.0f}s")
+                    else:
+                        self._gecko_next[kind] = now + every
+                        errors.append(str(e))
         for path in ("/token-profiles/latest/v1", "/token-boosts/latest/v1"):
             try:
                 data = self.http.get_json(self.DEX + path)

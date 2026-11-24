@@ -5,7 +5,7 @@ from tradebot.agents import HolderMap, LPAuditor, ProfitTaker, RiskSizer, StopGu
 from tradebot.broker import PaperBroker, pool_impact
 from tradebot.config import Config, load_config
 from tradebot.engine import Engine
-from tradebot.feeds import SimFeed, parse_dexscreener_pairs, parse_geckoterminal_pools, parse_goplus, parse_rugcheck
+from tradebot.feeds import DexScreenerFeed, FeedError, SimFeed, parse_dexscreener_pairs, parse_geckoterminal_pools, parse_goplus, parse_rugcheck
 from tradebot.models import SafetyReport, TokenSnapshot
 
 
@@ -255,3 +255,29 @@ def test_parse_geckoterminal_new_pools_picks_the_meme_side():
                      pool("0xMEME1", wbnb, 60_000)]}       # duplicate
     assert parse_geckoterminal_pools(data, 10_000) == ["0xMEME1", "0xMEME2"]
     assert parse_geckoterminal_pools({}, 0) == []
+
+
+def test_geckoterminal_is_polled_slowly_and_backs_off_on_429(monkeypatch):
+    feed = DexScreenerFeed(load_config())
+    calls = []
+
+    class FakeHttp:
+        def get_json(self, url):
+            calls.append(url)
+            if "geckoterminal" in url:
+                raise FeedError(f"GET {url}: HTTP Error 429: Too Many Requests")
+            return []
+
+    feed.http = FakeHttp()
+    clock = [1000.0]
+    monkeypatch.setattr("tradebot.feeds.time.monotonic", lambda: clock[0])
+    gecko = lambda: sum("geckoterminal" in u for u in calls)
+
+    feed.discover()
+    assert gecko() == 2 and feed.pop_warnings() == []     # 429 is not logged as an error
+    clock[0] += 40                                        # new_pools would be due, but backed off to 60s
+    feed.discover()
+    assert gecko() == 2
+    clock[0] += 30
+    feed.discover()
+    assert gecko() == 3                                   # new_pools retried after 60s, trending still waiting
