@@ -1,0 +1,10 @@
+logs/
+__pycache__/
+*.pyc
+.pytest_cache/
+config.json
+.env
+*.key
+live_state.json
+live_state.json.tmp
+STOP
